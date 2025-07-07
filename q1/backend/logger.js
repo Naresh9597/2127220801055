@@ -1,6 +1,6 @@
 const axios = require('axios');
 
-const TEST_LOG_SERVER_URL = 'http://20.244.56.144/evaluation-service/logs'; // Replace with actual test server URL
+const TEST_LOG_SERVER_URL = 'http://20.244.56.144/evaluation-service/logs';
 
 /**
  * Sends a log to the test server.
