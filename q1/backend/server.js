@@ -1,110 +1,129 @@
 const express = require('express');
 const crypto = require('crypto');
 const { URL } = require('url');
-const { Log } = require('./logger');
 
 const app = express();
 app.use(express.json());
 
-// Logging middleware for requests
-app.use(async (req, res, next) => {
-    await Log('backend', 'info', 'middleware', `Incoming ${req.method} ${req.url}`);
-    next();
+// Middleware: Console log each incoming request
+app.use((req, res, next) => {
+  const timestamp = new Date().toISOString();
+  console.log(`[${timestamp}] ${req.method} ${req.url}`);
+  next();
 });
 
-// POST /shorturls - Create short URL
-app.post('/shorturls', async (req, res) => {
-    let { url, validity, shortcode } = req.body;
+// In-memory link storage
+const linkRecords = {}; 
+// Format: { shortcode: { originalUrl, createdAt, expiry, clicks, clickDetails } }
 
-    if (!url || !isValidUrl(url)) {
-        await Log('backend', 'error', 'shorturl', 'Invalid or missing URL');
-        return res.status(400).json({ error: 'Invalid or missing URL' });
-    }
+// Utility: Check if a given URL string is valid
+function isValidWebUrl(input) {
+  try {
+    new URL(input);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
-    let validityMins = parseInt(validity, 10);
-    if (isNaN(validityMins) || validityMins <= 0) validityMins = 30;
+// Utility: Generate a new shortcode
+function createShortCode() {
+  let newCode;
+  do {
+    newCode = crypto.randomBytes(3).toString('base64url');
+  } while (linkRecords[newCode]);
+  return newCode;
+}
 
-    if (shortcode) {
-        if (urlDatabase[shortcode]) {
-            await Log('backend', 'warn', 'shorturl', `Shortcode conflict: ${shortcode}`);
-            return res.status(409).json({ error: 'Shortcode already in use' });
-        }
-    } else {
-        shortcode = generateShortCode();
-    }
+// Route: Create a short URL
+// POST /shorturls
+app.post('/shorturls', (req, res) => {
+  const { url, validity, shortcode } = req.body;
 
-    const createdAt = new Date();
-    const expiry = new Date(createdAt.getTime() + validityMins * 60000);
+  if (!url || !isValidWebUrl(url)) {
+    return res.status(400).json({ error: 'Invalid or missing URL' });
+  }
 
-    urlDatabase[shortcode] = {
-        originalUrl: url,
-        createdAt,
-        expiry,
-        clicks: 0,
-        clickDetails: []
-    };
+  let duration = parseInt(validity, 10);
+  if (isNaN(duration) || duration <= 0) duration = 30;
 
-    await Log('backend', 'info', 'shorturl', `Short URL created: ${shortcode}`);
+  let finalCode = shortcode || createShortCode();
 
-    res.json({
-        shortLink: `${req.protocol}://${req.get('host')}/shorturls/${shortcode}`,
-        expiry: expiry.toISOString()
-    });
+  if (shortcode && linkRecords[shortcode]) {
+    return res.status(409).json({ error: 'Shortcode already in use' });
+  }
+
+  const createdAt = new Date();
+  const expiresAt = new Date(createdAt.getTime() + duration * 60000);
+
+  linkRecords[finalCode] = {
+    originalUrl: url,
+    createdAt,
+    expiry: expiresAt,
+    clicks: 0,
+    clickDetails: []
+  };
+
+  res.json({
+    shortLink: `${req.protocol}://${req.get('host')}/shorturls/${finalCode}`,
+    expiry: expiresAt.toISOString()
+  });
 });
 
-// GET /shorturls/:code - Redirect and log click
-app.get('/shorturls/:code', async (req, res) => {
-    const entry = urlDatabase[req.params.code];
-    if (!entry) {
-        await Log('backend', 'warn', 'redirect', `Shortcode not found: ${req.params.code}`);
-        return res.status(404).json({ error: 'Shortcode not found' });
-    }
+// Route: Redirect to original URL using shortcode
+// GET /shorturls/:code
+app.get('/shorturls/:code', (req, res) => {
+  const code = req.params.code;
+  const linkData = linkRecords[code];
 
-    const now = new Date();
-    if (now > entry.expiry) {
-        await Log('backend', 'info', 'redirect', `Shortlink expired: ${req.params.code}`);
-        return res.status(410).json({ error: 'Shortlink expired' });
-    }
+  if (!linkData) {
+    return res.status(404).json({ error: 'Shortcode not found' });
+  }
 
-    entry.clicks += 1;
-    entry.clickDetails.push({
-        timestamp: now.toISOString(),
-        referrer: req.get('referer') || null,
-        location: req.ip
-    });
+  const currentTime = new Date();
+  if (currentTime > linkData.expiry) {
+    return res.status(410).json({ error: 'Shortlink expired' });
+  }
 
-    await Log('backend', 'info', 'redirect', `Redirected: ${req.params.code} to ${entry.originalUrl}`);
+  // Track usage
+  linkData.clicks++;
+  linkData.clickDetails.push({
+    timestamp: currentTime.toISOString(),
+    referrer: req.get('referer') || null,
+    location: req.ip
+  });
 
-    res.redirect(entry.originalUrl);
+  res.redirect(linkData.originalUrl);
 });
 
-// GET /shorturls/:code/stats - Usage statistics
-app.get('/shorturls/:code/stats', async (req, res) => {
-    const entry = urlDatabase[req.params.code];
-    if (!entry) {
-        await Log('backend', 'warn', 'stats', `Stats requested for missing shortcode: ${req.params.code}`);
-        return res.status(404).json({ error: 'Shortcode not found' });
-    }
+// Route: Get statistics about the short URL
+// GET /shorturls/:code/stats
+app.get('/shorturls/:code/stats', (req, res) => {
+  const code = req.params.code;
+  const linkData = linkRecords[code];
 
-    await Log('backend', 'info', 'stats', `Stats retrieved for shortcode: ${req.params.code}`);
+  if (!linkData) {
+    return res.status(404).json({ error: 'Shortcode not found' });
+  }
 
-    res.json({
-        shortcode: req.params.code,
-        originalUrl: entry.originalUrl,
-        createdAt: entry.createdAt.toISOString(),
-        expiry: entry.expiry.toISOString(),
-        totalClicks: entry.clicks,
-        clickDetails: entry.clickDetails
-    });
+  res.json({
+    shortcode: code,
+    originalUrl: linkData.originalUrl,
+    createdAt: linkData.createdAt.toISOString(),
+    expiry: linkData.expiry.toISOString(),
+    totalClicks: linkData.clicks,
+    clickDetails: linkData.clickDetails
+  });
 });
 
-// Error handler
-app.use(async (err, req, res, next) => {
-    await Log('backend', 'error', 'handler', err.stack || err.message);
-    res.status(500).json({ error: 'Internal server error' });
+// Global error handler
+app.use((err, req, res, next) => {
+  console.error('Unexpected error:', err.stack);
+  res.status(500).json({ error: 'Internal server error' });
 });
 
+// Start server
 const PORT = 3000;
 app.listen(PORT, () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`Server running on http://localhost:${PORT}`);
 });
